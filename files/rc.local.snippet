@@ -1,0 +1,9 @@
+# vlan-coupling bootstrap
+systemctl is-active --quiet vlan-coupling-watcher 2>/dev/null || {
+    [ -f /rw/config/vlan-coupling-watcher.service ] && {
+        ln -sf /rw/config/vlan-coupling-watcher.service /etc/systemd/system/
+        systemctl daemon-reload
+        systemctl enable vlan-coupling-watcher.service
+        systemctl start vlan-coupling-watcher.service
+    }
+}

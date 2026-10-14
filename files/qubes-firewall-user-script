@@ -1,0 +1,233 @@
+#!/bin/sh
+# /rw/config/qubes-firewall-user-script in sys-net
+#
+# VLAN coupling: routes each directly-attached network-providing qube's
+# traffic out a chosen uplink (VLAN), with deterministic per-VLAN DNS.
+#
+# Mechanism:
+#   prerouting(mangle, -150)  : set fwmark by ingress vif (per-qube)
+#   prerouting(dstnat-1, -99) : per-vif DNAT of DNS to that VLAN's resolver
+#                               (keyed on iifname, NOT on the mark - DNS
+#                               interception is independent of mark numbering)
+#   routing                   : fwmark selects a per-uplink policy table
+#   NAT                       : none here - Qubes' catch-all masquerade in
+#                               table 'ip qubes' picks the egress address
+#   qubes-nat-accel           : per-vif 'return' inserted ahead of the
+#                               flow-add rule so marked flows never offload
+#
+# Marks are derived from the VLAN tag (ens7.13 -> 0x100d = 4096+13);
+# interfaces without a tag fall back to positional numbering. Table numbers
+# remain positional - they never appear in nft dumps.
+#
+# Triggers: qubes-firewall reloads, rc.local watcher (nmcli monitor), or
+# any manual invocation. Fully idempotent, with a fingerprint no-op path
+# so frequent runs are nearly free.
+#
+# Execution order is significant:
+#   1 helpers  2 config  3 uplinks  4 fingerprint+early-exit
+#   5 purge    6 routing 7 nft build 8 write state LAST
+# The state file is only written on complete success; a mid-run failure
+# leaves the old state, so the next invocation rebuilds.
+
+CONF=/rw/config/vlan-coupling.conf
+STATE=/rw/config/.vlan-coupling.state
+QUBES_NET=10.138.0.0/16        # internal space: never marked, main table
+DNS_STUB_NET=10.139.1.0/24      # Qubes DNS stubs (10.139.1.1 / .2)
+MARK_BASE=256                   # positional fallback (NM uses low marks)
+TABLE_BASE=200                  # routing table numbers (positional)
+LOGTAG=vlan-coupling
+
+log(){ logger -t "$LOGTAG" -- "$*"; }
+
+vif_of(){ ip -o route get "$1" 2>/dev/null | awk '{print $3; exit}'; }
+
+# VLAN-tag-derived mark: stable across boots and uplink churn, readable
+# in nft dumps (0x100d == VLAN 13). Returns 1 for non-tagged names.
+mark_for(){
+    case "$1" in
+        *.*) printf '%d' $(( 4096 + ${1##*.} )) ;;
+        *)   return 1 ;;
+    esac
+}
+
+table_for(){
+    case "$1" in
+        *.*) printf '%d' $(( 3000 + ${1##*.} )) ;;
+        *)   return 1 ;;
+    esac
+}
+
+# -------------------------------------------------- 1/2. helpers, config
+BLANKET_DNS=$(sed -n 's/^BLANKET_DNS=//p' "$CONF" 2>/dev/null | tr -d '[:space:]')
+[ "$BLANKET_DNS" = "yes" ] || BLANKET_DNS=no
+
+CONF_LINES=$(mktemp)
+grep -Ev '^[[:space:]]*(#|BLANKET_DNS|$)' "$CONF" 2>/dev/null > "$CONF_LINES" \
+    || { log "missing $CONF - exiting"; rm -f "$CONF_LINES"; exit 0; }
+
+# ---------------------------------------------------- 3. uplink discovery
+# Any global-IPv4 non-vif non-lo interface with a gateway. Gateways/DNS
+# come from NetworkManager so they're correct even with never-default set.
+NUP=0
+for ifc in $(ip -o -4 addr show scope global | awk '{print $2}' | sort -u \
+            | grep -v '^vif' | grep -vx 'lo'); do
+    gw=$(nmcli -g IP4.GATEWAY device show "$ifc" 2>/dev/null | head -n1)
+    [ -n "$gw" ] || continue
+    dns=$(nmcli -g IP4.DNS device show "$ifc" 2>/dev/null | head -n1)
+    NUP=$((NUP+1))
+    eval "UPIF_$NUP=\$ifc UPGW_$NUP=\$gw UPDNS_$NUP=\${dns:-\$gw}"
+    log "uplink $NUP: $ifc gw=$gw dns=${dns:-$gw}"
+done
+[ "$NUP" -gt 0 ] || { log "no uplinks up yet; nothing to do"; rm -f "$CONF_LINES"; exit 0; }
+
+# ------------------------------------------ 4. fingerprint + early exit
+# Captures every input that affects the ruleset: uplink gateways/DNS,
+# per-conf-line vif presence, accel bypass presence, blanket setting.
+# Runs BEFORE any mutation so a no-op costs nothing.
+fingerprint(){
+    for i in $(seq "$NUP"); do
+        eval echo "up \$UPIF_$i \$UPGW_$i \$UPDNS_$i"
+    done
+    while read -r qip ifc odns; do
+        v=$(vif_of "$qip")
+        case "$v" in
+            vif*.*)
+                if nft list chain inet qubes-nat-accel qubes-accel 2>/dev/null \
+                        | grep -q "iifname \"$v\" return"; then
+                    echo "q $qip $ifc $odns $v ok"
+                else
+                    echo "q $qip $ifc $odns $v accel-missing"
+                fi ;;
+            *) echo "q $qip $ifc $odns down" ;;
+        esac
+    done < "$CONF_LINES"
+    echo "BLANKET_DNS=$BLANKET_DNS"
+}
+FP=$(fingerprint | md5sum | cut -d' ' -f1)
+oldFP="$(cat ${STATE} 2>/dev/null || echo missing)"
+# log "fingerprint: ${FP}: $(fingerprint)"
+if [ -f "$STATE" ] && [ "$(cat "$STATE")" = "$FP" ] \
+        && nft list table ip vlan_coupling >/dev/null 2>&1 \
+        && ! nft list table ip qubes_vlan_coupling >/dev/null 2>&1 \
+        && ! ip rule list | grep -q 'fwmark 0x1 .*pref 1000'; then
+    rm -f "$CONF_LINES"
+    log "${FP}: no change"
+    exit 0   # nothing changed, rules intact - stay quiet
+fi
+
+[ -f "$STATE" ] || {
+    # on (re)start, cleanup the ip rules
+    removed=0
+    for p in $(seq 5000 5999); do
+        while ip rule del pref "$p" 2>/dev/null; do removed=$((removed+1)); done
+    done
+    [ "$removed" -gt 0 ] && log "pref sweep: removed $removed stale ip rules"
+}
+
+# ------------------------------------------------------- 5. legacy purge
+nft delete table ip qubes_vlan_coupling 2>/dev/null && \
+    log "purged legacy table qubes_vlan_coupling"
+for m in 1 13; do
+    while ip rule del fwmark "$m" 2>/dev/null; do
+        log "purged legacy fwmark $m rule"
+    done
+done
+for t in 101 102; do
+    if [ -n "$(ip route show table "$t" 2>/dev/null)" ]; then
+        ip route flush table "$t" && log "flushed legacy table $t"
+    fi
+done
+
+# -------------------------------------------------- 6. policy routing
+# One table per uplink, selected by fwmark set in prerouting(mangle).
+for i in $(seq "$NUP"); do
+    eval ifc=\$UPIF_$i gw=\$UPGW_$i
+    M=$(mark_for  "$ifc") || M=$((MARK_BASE+i))
+    T=$(table_for "$ifc") || T=$((TABLE_BASE+i))
+    ip route replace default via "$gw" dev "$ifc" table "$T" 2>/dev/null \
+        || { log "route table $T via $gw dev $ifc FAILED"; continue; }
+    while ip rule del fwmark "$M" table "$T" 2>/dev/null; do :; done
+    ip rule add fwmark "$M" table "$T" pref $((5000+i)) \
+        || log "ip rule fwmark $M table $T FAILED"
+done
+
+# ------------------------------------------- 7. nft table construction
+nft delete table ip vlan_coupling 2>/dev/null
+nft add table ip vlan_coupling
+nft add chain ip vlan_coupling mangle \
+    '{ type filter hook prerouting priority mangle; policy accept; }'
+nft add chain ip vlan_coupling dns \
+    '{ type nat hook prerouting priority dstnat - 1; policy accept; }'
+# No postrouting chain: Qubes' catch-all masquerade owns NAT, one owner.
+
+# per-vif accel bypass: exactly one early 'return', ahead of flow-add
+accel_bypass(){
+    nft -a list chain inet qubes-nat-accel qubes-accel 2>/dev/null \
+        | grep "iifname \"$1\" return" | grep -o 'handle [0-9]*' \
+        | awk '{print $2}' | while read -r h; do
+            nft delete rule inet qubes-nat-accel qubes-accel handle "$h"
+          done
+    nft insert rule inet qubes-nat-accel qubes-accel iifname "$1" return \
+        2>/dev/null || log "accel bypass for $1 skipped (table absent)"
+}
+
+while read -r qip ifc odns; do
+    # locate this uplink's index
+    idx=0
+    for j in $(seq "$NUP"); do
+        eval c=\$UPIF_$j
+        [ "$c" = "$ifc" ] && idx=$j
+    done
+    [ "$idx" -gt 0 ] || { log "skip $qip: uplink $ifc not up"; continue; }
+
+    # vif discovery with validation: 'ip route get' returns a GATEWAY
+    # address when the qube is not running (or lives behind a firewall);
+    # neither may be treated as an interface name. Note: a qube that is
+    # simply powered off shows up here too - its conf line stays valid
+    # and activates when it boots.
+    vif=$(vif_of "$qip")
+    case "$vif" in
+        vif*.*) : ;;
+        *) log "skip $qip: no vif in sys-net yet (qube not running, or downstream)"; continue ;;
+    esac
+
+    M=$(mark_for  "$ifc") || M=$((MARK_BASE+idx))
+    T=$(table_for "$ifc") || T=$((TABLE_BASE+idx))
+
+    eval dns=\$UPDNS_$idx
+    [ -n "$odns" ] && dns="$odns"
+
+    # Mark on ingress, exempting qubes-internal destinations so local
+    # delivery (sys-net itself, qube-to-qube) stays on the main table.
+    # DNS stubs (10.139.1.x) are deliberately NOT exempted - but see
+    # below: DNS DNAT is iifname-keyed, independent of this mark.
+    nft add rule ip vlan_coupling mangle iifname "$vif" \
+        ip daddr != "$QUBES_NET" counter meta mark set "$M"
+
+    # DNS interception, keyed on the vif directly. Counter sits after
+    # all matches so it only ticks on genuine redirections.
+    for proto in udp tcp; do
+        nft add rule ip vlan_coupling dns iifname "$vif" \
+            ip daddr "$DNS_STUB_NET" "$proto" dport 53 counter dnat to "$dns"
+        if [ "$BLANKET_DNS" = "yes" ]; then
+            nft add rule ip vlan_coupling dns iifname "$vif" \
+                ip daddr != "$QUBES_NET" "$proto" dport 53 counter dnat to "$dns"
+        fi
+    done
+
+    accel_bypass "$vif"
+
+    log "coupled $qip ($vif) -> $ifc: mark $M, table $T, dns $dns"
+done < "$CONF_LINES"
+
+# ----------------------------------------------------- 8. record success
+# Recompute AFTER the rebuild. The pre-build fingerprint describes the
+# not-yet-fixed world (e.g. accel bypass absent, vif routes in flux), which
+# the rebuild itself changes - storing that would guarantee a spurious
+# extra rebuild on the next invocation.
+newFP=$(fingerprint | md5sum | cut -d' ' -f1)
+log "old:${oldFP} new:${newFP}"
+echo "$newFP" > "$STATE"
+rm -f "$CONF_LINES"
+exit
+

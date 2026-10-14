@@ -1,0 +1,12 @@
+[Unit]
+Description=VLAN Coupling Watcher for Qubes
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/rw/config/vlan-coupling-watch.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
